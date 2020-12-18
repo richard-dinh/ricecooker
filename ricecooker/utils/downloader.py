@@ -1,8 +1,12 @@
 import concurrent.futures
 import copy
+import json
+import mimetypes
 import os
 import re
 import requests
+import shutil
+import tempfile
 import time
 from urllib.parse import urlparse, urljoin
 import uuid
@@ -15,6 +19,7 @@ from requests_file import FileAdapter
 from ricecooker.config import LOGGER, PHANTOMJS_PATH, STRICT
 from ricecooker.utils.html import download_file
 from ricecooker.utils.caching import CacheForeverHeuristic, FileCache, CacheControlAdapter, InvalidatingCacheControlAdapter
+from ricecooker.utils.zip import create_predictable_zip
 
 DOWNLOAD_SESSION = requests.Session()                          # Session for downloading content from urls
 DOWNLOAD_SESSION.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
@@ -22,6 +27,9 @@ DOWNLOAD_SESSION.mount('file://', FileAdapter())
 # use_dir_lock works with all filesystems and OSes
 cache = FileCache('.webcache', use_dir_lock=True)
 forever_adapter= CacheControlAdapter(heuristic=CacheForeverHeuristic(), cache=cache)
+
+# we can't use requests caching for pyppeteer / phantomjs, so track those separately.
+downloaded_pages = []
 
 DOWNLOAD_SESSION.mount('http://', forever_adapter)
 DOWNLOAD_SESSION.mount('https://', forever_adapter)
@@ -43,6 +51,7 @@ try:
         browser = await launch({'headless': True})
         content = None
         cookies = None
+        page = None
         try:
             page = await browser.newPage()
             pid = browser.process.pid
@@ -52,6 +61,7 @@ try:
                 # some sites have API calls running regularly, so the timeout may be that there's never any true
                 # network idle time. Try 'networkidle2' option instead before determining we can't scrape.
                 if not strict:
+                    LOGGER.info("Attempting to download URL with networkidle2 instead of networkidle0...")
                     await page.goto(path, {'timeout': timeout * 1000, 'waitUntil': ['load', 'domcontentloaded', 'networkidle2']})
                 else:
                     raise
@@ -61,11 +71,9 @@ try:
             await browser.close()
         except Exception as e:
             LOGGER.warning("Error scraping page: {}".format(e))
-            subprocess.call("taskkill /F /PID {}".format(pid))
-            raise Exception("Error scraping page: {}".format(e))
-        # finally:
-        #     await browser.close()
-        return content, {'cookies': cookies}
+        finally:
+            await browser.close()
+        return content, {'cookies': cookies, 'url': path}
     USE_PYPPETEER = True
 except:
     print("Unable to load pyppeteer, using phantomjs for JS loading.")
@@ -98,9 +106,6 @@ def read(path, loadjs=False, session=None, driver=None, timeout=60,
     """
     session = session or DOWNLOAD_SESSION
 
-    if clear_cookies:
-        session.cookies.clear()
-
     try:
         if loadjs:                                              # Wait until js loads then return contents
             if USE_PYPPETEER:
@@ -118,21 +123,8 @@ def read(path, loadjs=False, session=None, driver=None, timeout=60,
             return driver.page_source
 
         else:                                                   # Read page contents from url
-            retry_count = 0
-            max_retries = 5
-            while True:
-                try:
-                    response = session.get(path, stream=True, timeout=timeout)
-                    break
-                except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
-                    retry_count += 1
-                    print("Error with connection ('{msg}'); about to perform retry {count} of {trymax}."
-                        .format(msg=str(e), count=retry_count, trymax=max_retries))
-                    time.sleep(retry_count * 1)
-                    if retry_count >= max_retries:
-                        raise e
+            response = make_request(path, clear_cookies, session=session)
 
-            response.raise_for_status()
             return response.content
 
     except (requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema):
@@ -140,8 +132,8 @@ def read(path, loadjs=False, session=None, driver=None, timeout=60,
             return fobj.read()
 
 
-def make_request(url, clear_cookies=False, headers=None, timeout=60, *args, **kwargs):
-    sess = DOWNLOAD_SESSION
+def make_request(url, clear_cookies=False, headers=None, timeout=60, session=None, *args, **kwargs):
+    sess = session or DOWNLOAD_SESSION
 
     if clear_cookies:
         sess.cookies.clear()
@@ -153,24 +145,24 @@ def make_request(url, clear_cookies=False, headers=None, timeout=60, *args, **kw
         request_headers = copy.copy(DEFAULT_HEADERS)
         request_headers.update(headers)
 
-    while True:
+    while retry_count <= max_retries:
         try:
-            response = sess.get(url, headers=request_headers, timeout=timeout, *args, **kwargs)
-            break
+            response = sess.get(url, headers=request_headers, stream=True, timeout=timeout, *args, **kwargs)
+            if response.status_code != 200:
+                LOGGER.error("{} error while trying to download {}".format(response.status_code, url))
+                if STRICT:
+                    response.raise_for_status()
+            return response
         except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
             retry_count += 1
-            print("Error with connection ('{msg}'); about to perform retry {count} of {trymax}."
+            LOGGER.warning("Error with connection ('{msg}'); about to perform retry {count} of {trymax}."
                   .format(msg=str(e), count=retry_count, trymax=max_retries))
             time.sleep(retry_count * 1)
-            if retry_count >= max_retries:
-                raise e
-
-    if response.status_code != 200:
-        print("NOT FOUND:", url)
-        if STRICT:
-            response.raise_for_status()
-
-    return response
+            if retry_count > max_retries:
+                LOGGER.error("Could not connect to: {}".format(url))
+                if STRICT:
+                    raise e
+    return None
 
 
 _CSS_URL_RE = re.compile(r"url\(['\"]?(.*?)['\"]?\)")
@@ -184,7 +176,7 @@ def _derive_filename(url):
 
 def download_static_assets(doc, destination, base_url,
         request_fn=make_request, url_blacklist=[], js_middleware=None,
-        css_middleware=None, derive_filename=_derive_filename):
+        css_middleware=None, derive_filename=_derive_filename, link_policy=None, run_js=False):
     """
     Download all static assets referenced from an HTML page.
     The goal is to easily create HTML5 apps! Downloads JS, CSS, images, and
@@ -209,6 +201,12 @@ def download_static_assets(doc, destination, base_url,
     downloaded static files, as a BeautifulSoup object. (Call str() on it to
     extract the raw HTML.)
     """
+    # without the ending /, some functions will treat the last path component like a filename, so add it.
+    if not base_url.endswith('/'):
+        base_url += '/'
+
+    LOGGER.debug("base_url = {}".format(base_url))
+
     if not isinstance(doc, BeautifulSoup):
         doc = BeautifulSoup(doc, "html.parser")
 
@@ -232,7 +230,7 @@ def download_static_assets(doc, destination, base_url,
             url = urljoin(base_url, node[attr])
 
             if _is_blacklisted(url, url_blacklist):
-                print('        Skipping downloading blacklisted url', url)
+                LOGGER.info('        Skipping downloading blacklisted url', url)
                 node[attr] = ""
                 continue
 
@@ -240,11 +238,29 @@ def download_static_assets(doc, destination, base_url,
                 url = url_middleware(url)
 
             filename = derive_filename(url)
+            _path, ext = os.path.splitext(filename)
+            subpath = None
+            if not ext:
+                # This COULD be an index file in a dir, or just a file with no extension. Handle either case by
+                # turning the path into filename + '/index' + the file extension from the content type
+                response = requests.get(url)
+                type = response.headers['content-type'].split(';')[0]
+                ext = mimetypes.guess_extension(type)
+                # if we're really stuck, just default to HTML as that is most likely if this is a redirect.
+                if not ext:
+                    ext = '.html'
+                subpath = os.path.dirname(filename)
+                filename = 'index{}'.format(ext)
+
+                os.makedirs(os.path.join(destination, subpath), exist_ok=True)
+
             node[attr] = filename
 
-            print("        Downloading", url, "to filename", filename)
-            download_file(url, destination, request_fn=request_fn,
-                    filename=filename, middleware_callbacks=content_middleware)
+            fullpath = os.path.join(destination, filename)
+            if not os.path.exists(fullpath):
+                LOGGER.info("Downloading {} to filename {}".format(url, fullpath))
+                download_file(url, destination, request_fn=request_fn,
+                    filename=filename, subpath=subpath, middleware_callbacks=content_middleware)
 
     def js_content_middleware(content, url, **kwargs):
         if js_middleware:
@@ -252,7 +268,9 @@ def download_static_assets(doc, destination, base_url,
         return content
 
     def css_node_filter(node):
-        return "stylesheet" in node["rel"]
+        if "rel" in node:
+            return "stylesheet" in node["rel"]
+        return node["href"].split("?")[0].strip().endswith(".css")
 
     def css_content_middleware(content, url, **kwargs):
         if css_middleware:
@@ -299,8 +317,12 @@ def download_static_assets(doc, destination, base_url,
                 else:
                     new_url = derived_filename
 
-            download_file(src_url, destination, request_fn=request_fn,
+            fullpath = os.path.join(destination, derived_filename)
+            if not os.path.exists(fullpath):
+                download_file(src_url, destination, request_fn=request_fn,
                     filename=derived_filename)
+            else:
+                LOGGER.info("Resource already downloaded, skipping: {}".format(src_url))
             return 'url("%s")' % new_url
 
         return _CSS_URL_RE.sub(repl, content)
@@ -315,6 +337,58 @@ def download_static_assets(doc, destination, base_url,
     download_assets("source[src]", "src") # Potentially audio
     download_assets("source[srcset]", "srcset") # Potentially audio
 
+    # Link scraping can be expensive, so it's off by default. We decrement the levels value every time we recurse
+    # so skip once we hit zero.
+    if link_policy is not None and link_policy['levels'] > 0:
+        nodes = doc.select("iframe[src]")
+        nodes += doc.select("a[href]")
+        # TODO: add "a[href]" handling to this and/or ways to whitelist / blacklist tags and urls
+        for node in nodes:
+            url = None
+            if node.name == 'iframe':
+                url = node['src']
+            elif node.name == 'a':
+                url = node['href']
+            assert url is not None
+            url = url.split('#')[0]  # Ignore bookmarks in URL
+            parts = urlparse(url)
+            should_scrape = 'all' in link_policy['scope']
+            if not parts.scheme or parts.scheme.startswith('http'):
+                LOGGER.info("checking url: {}".format(url))
+                if not parts.netloc:
+                    url = urljoin(base_url, url)
+                if 'whitelist' in link_policy:
+                    for whitelist_item in link_policy['whitelist']:
+                        if whitelist_item in url:
+                            should_scrape = True
+                            break
+
+                if 'blacklist' in link_policy:
+                    for blacklist_item in link_policy['blacklist']:
+                        if blacklist_item in url:
+                            should_scrape = False
+                            break
+
+            if should_scrape:
+                policy = copy.copy(link_policy)
+                # make sure we reduce the depth level by one each time we recurse
+                policy['levels'] -= 1
+                # no extension is most likely going to return HTML as well.
+                is_html = os.path.splitext(url)[1] in ['.htm', '.html', '.xhtml', '']
+                derived_filename = derive_filename(url)
+                if is_html:
+                    if not url in downloaded_pages:
+                        LOGGER.info("Downloading linked HTML page {}".format(url))
+                        downloaded_pages.append(url)
+                        archive_page(url, destination, link_policy=policy, run_js=run_js)
+                else:
+                    full_path = os.path.join(destination, derived_filename)
+                    if not os.path.exists(full_path):
+                        LOGGER.info("Downloading file {}".format(url))
+                        download_file(url, destination, filename=derived_filename)
+                    else:
+                        LOGGER.info("File already downloaded, skipping: {}".format(url))
+
     # ... and also run the middleware on CSS/JS embedded in the page source to
     # get linked files.
     for node in doc.select('style'):
@@ -327,8 +401,14 @@ def download_static_assets(doc, destination, base_url,
     return doc
 
 
-def get_archive_filename(url, page_domain=None, download_root=None, urls_to_replace=None):
+def get_archive_filename(url, page_domain=None, page_url=None, download_root=None, urls_to_replace=None):
     file_url_parsed = urlparse(url)
+    page_url_parsed = None
+    LOGGER.debug("page_domain = {}, page_url = {}".format(page_domain, page_url))
+    if page_url:
+        page_url_parsed = urlparse(page_url)
+        if not page_domain and page_url_parsed.netloc:
+            page_domain = page_url_parsed.netloc
 
     no_scheme_url = url
     if file_url_parsed.scheme != '':
@@ -337,30 +417,67 @@ def get_archive_filename(url, page_domain=None, download_root=None, urls_to_repl
     domain = file_url_parsed.netloc.replace(':', '_')
     if not domain and page_domain:
         domain = page_domain
+        if rel_path.startswith('/') and not url.startswith('/'):
+            # urlparse assumes links that are relative are relative to the domain root, which is not
+            # a safe assumption. Just use the original passed in URL for further processing.
+            rel_path = url
+
     if rel_path.startswith('/'):
+        LOGGER.info("rel_path = {}, parsed path = {}".format(rel_path, file_url_parsed.path))
         rel_path = rel_path[1:]
+        assert not rel_path.startswith('/')
+    elif rel_path:
+        LOGGER.info("rel_path = '{}'".format(rel_path))
+        # it is relative to the current subdir, not the root of the domain
+        if page_url_parsed.path.endswith('/'):
+            rel_path = page_url_parsed.path + rel_path
+        else:
+            rel_path = os.path.dirname(page_url_parsed.path) + '/' + rel_path
+    if file_url_parsed.query:
+        rel_path += "_{}".format(file_url_parsed.query.replace('=', '_').replace('&', '_'))
+        LOGGER.info("rel_path is now {}".format(rel_path))
+
+    assert not rel_path.startswith('/')
     url_local_dir = os.path.join(domain, rel_path)
-    assert domain in url_local_dir
+    assert domain in url_local_dir, "error: {} not in {} for {}, rel_path = '{}'".format(domain, url_local_dir, url, rel_path)
+
+    _path, ext = os.path.splitext(url_local_dir)
     local_dir_name = os.path.dirname(url_local_dir)
+    if ext != '':
+        local_dir_name = os.path.dirname(url_local_dir)
     if local_dir_name != url_local_dir and urls_to_replace is not None:
         full_dir = os.path.join(download_root, local_dir_name)
         os.makedirs(full_dir, exist_ok=True)
         urls_to_replace[url] = no_scheme_url
+    elif urls_to_replace:
+        urls_to_replace[url] = url
     return url_local_dir
 
 
-def archive_page(url, download_root):
+def archive_page(url, download_root, link_policy=None, run_js=False, strict=False):
     """
     Download fully rendered page and all related assets into ricecooker's site archive format.
 
     :param url: URL to download
     :param download_root: Site archive root directory
+    :param link_policy: a dict of the following policy, or None to ignore all links.
+            key: policy, value: string, one of "scrape" or "ignore"
+            key: scope, value: string, one of "same_domain", "external", "all"
+            key: levels, value: integer, number of levels deep to apply this policy
+
     :return: A dict containing info about the page archive operation
     """
 
     os.makedirs(download_root, exist_ok=True)
-    content, props = asyncio.get_event_loop().run_until_complete(load_page(url))
+    if run_js:
+        content, props = asyncio.get_event_loop().run_until_complete(load_page(url, strict=strict))
+    else:
+        response = make_request(url)
+        props = {'cookies': requests.utils.dict_from_cookiejar(response.cookies), 'url': response.url}
+        content = response.text
 
+    # url may be redirected, for relative link handling we want the final URL that was loaded.
+    url = props['url']
     parsed_url = urlparse(url)
     page_domain = parsed_url.netloc.replace(':', '_')
 
@@ -369,11 +486,17 @@ def archive_page(url, download_root):
     urls_to_replace = {}
 
     if content:
+        LOGGER.warning("Downloading linked files for {}".format(url))
+        page_url = url
         def html5_derive_filename(url):
-            return get_archive_filename(url, page_domain, download_root, urls_to_replace)
-        download_static_assets(content, download_root, base_url, derive_filename=html5_derive_filename)
+            return get_archive_filename(url, page_domain, page_url, download_root, urls_to_replace)
+        download_static_assets(content, download_root, base_url, derive_filename=html5_derive_filename,
+                               link_policy=link_policy, run_js=run_js)
 
         for key in urls_to_replace:
+            value = urls_to_replace[key]
+            if key == value:
+                continue
             url_parts = urlparse(key)
             # When we get an absolute URL, it may appear in one of three different ways in the page:
             key_variants = [
@@ -391,20 +514,26 @@ def archive_page(url, download_root):
                 # trying to replace
                 # we avoid using BeautifulSoup because Python HTML parsers can be destructive and
                 # do things like strip out the doctype.
-                content = content.replace('="{}"'.format(variant), '="{}"'.format(urls_to_replace[key]))
-                content = content.replace('url({})'.format(variant), 'url({})'.format(urls_to_replace[key]))
+                content = content.replace('="{}"'.format(variant), '="{}"'.format(value))
+                content = content.replace('url({})'.format(variant), 'url({})'.format(value))
 
             if content == orig_content:
                 LOGGER.debug("link not replaced: {}".format(key))
                 LOGGER.debug("key_variants = {}".format(key_variants))
 
-        download_dir = os.path.join(page_domain, parsed_url.path.split('/')[-1].replace('?', '_'))
-        download_path = os.path.join(download_root, download_dir)
-        os.makedirs(download_path, exist_ok=True)
+        download_path = os.path.join(download_root, html5_derive_filename(url))
+        _path, ext = os.path.splitext(download_path)
+        index_path = download_path
+        if '.htm' not in ext:
+            if download_path.endswith('/'):
+                index_path = download_path + 'index.html'
+            else:
+                index_path = download_path + '.html'
 
-        index_path = os.path.join(download_path, 'index.html')
-        f = open(index_path, 'w', encoding='utf-8')
-        f.write(content)
+        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+        soup = BeautifulSoup(content)
+        f = open(index_path, 'wb')
+        f.write(soup.prettify(encoding="utf-8"))
         f.close()
 
         page_info = {
@@ -413,7 +542,7 @@ def archive_page(url, download_root):
             'index_path': index_path,
             'resources': list(urls_to_replace.values())
         }
-
+        LOGGER.info("archive_page finished...")
         return page_info
 
     return None
@@ -456,3 +585,72 @@ def download_in_parallel(urls, func=None, max_workers=5):
             start = start + batch_size
 
     return results
+
+
+class ArchiveDownloader:
+    def __init__(self, root_dir):
+        self.root_dir = root_dir
+        self.cache_file = os.path.join(self.root_dir, 'archive_files.json')
+        self.cache_data = {}
+        if os.path.exists(self.cache_file):
+            self.cache_data = json.load(open(self.cache_file))
+
+    def save_cache_data(self):
+        with open(self.cache_file, 'w') as f:
+            f.write(json.dumps(self.cache_data, ensure_ascii=False, indent=2))
+
+    def clear_cache_data(self):
+        self.cache_data = {}
+        self.save_cache_data()
+
+    def get_page(self, url, refresh=False, link_policy=None, run_js=False, strict=False):
+        if refresh or not url in self.cache_data:
+            self.cache_data[url] = archive_page(url, download_root=self.root_dir, link_policy=link_policy, run_js=run_js, strict=strict)
+            self.save_cache_data()
+
+        return self.cache_data[url]
+
+    def create_dependency_zip(self, count_threshold=2):
+        resource_counts = {}
+        for url in self.cache_data:
+            info = self.cache_data[url]
+            resources = info['resources']
+            for resource in resources.values():
+                if not resource in resource_counts:
+                    resource_counts[resource] = 0
+                resource_counts[resource] += 1
+
+        shared_resources = []
+        for res in resource_counts:
+            if resource_counts[res] >= count_threshold:
+                shared_resources.append(res)
+
+        temp_dir = tempfile.mkdtemp()
+        self._copy_resources_to_dir(temp_dir, shared_resources)
+
+        self.dep_path = zip.create_predictable_zip(temp_dir)
+        return self.dep_path
+
+    def _copy_resources_to_dir(self, base_dir, resources):
+        for res in resources:
+            full_path = os.path.join(self.root_dir, res)
+            dest_path = os.path.join(base_dir, res)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copy2(full_path, dest_path)
+
+    def create_zip_dir_for_page(self, url):
+        if not url in self.cache_data:
+            raise KeyError("Please ensure you call get_page before calling this function to download the content.")
+        temp_dir = tempfile.mkdtemp()
+        info = self.cache_data[url]
+
+        # TODO: Add dependency zip handling that replaces links with the dependency zip location
+        self._copy_resources_to_dir(temp_dir, info['resources'].values())
+
+        shutil.copy(info['index_path'], os.path.join(temp_dir, 'index.html'))
+        return temp_dir
+
+    def export_page_as_zip(self, url):
+        zip_dir = self.create_zip_dir_for_page(url)
+
+        return zip.create_predictable_zip(zip_dir)
