@@ -6,6 +6,7 @@ import requests
 import time
 from urllib.parse import urlparse, urljoin
 import uuid
+import subprocess
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -44,6 +45,7 @@ try:
         cookies = None
         try:
             page = await browser.newPage()
+            pid = browser.process.pid
             try:
                 await page.goto(path, {'timeout': timeout * 1000, 'waitUntil': ['load', 'domcontentloaded', 'networkidle0']})
             except errors.TimeoutError:
@@ -56,10 +58,13 @@ try:
             # get the entire rendered page, including the doctype
             content = await page.content()
             cookies = await page.cookies()
+            await browser.close()
         except Exception as e:
             LOGGER.warning("Error scraping page: {}".format(e))
-        finally:
-            await browser.close()
+            subprocess.call("taskkill /F /PID {}".format(pid))
+            raise Exception("Error scraping page: {}".format(e))
+        # finally:
+        #     await browser.close()
         return content, {'cookies': cookies}
     USE_PYPPETEER = True
 except:

@@ -131,3 +131,7 @@ tests/testcontent/generated/
 .vscode/
 
 cache.sqlite
+chefdata
+.ricecooker-template
+.ricecookerfilecache
+chefdata/HTML5
