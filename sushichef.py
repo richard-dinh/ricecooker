@@ -155,7 +155,7 @@ def scrape_page(exp_id, language, subject_node):
     my_downloader = downloader.ArchiveDownloader(EXPERIMENTS_FOLDER)
     url = format_url(exp_id, language)
     # page = downloader.archive_page(url, EXPERIMENTS_FOLDER)
-    page = my_downloader.get_page(url)
+    page = my_downloader.get_page(url, refresh = True)
     my_zip_dir = my_downloader.create_zip_dir_for_page(url)
     index_file = os.path.join(my_zip_dir, 'index.html')
     # entry = page['index_path']
