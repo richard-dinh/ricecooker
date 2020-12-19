@@ -645,7 +645,7 @@ class ArchiveDownloader:
         info = self.cache_data[url]
 
         # TODO: Add dependency zip handling that replaces links with the dependency zip location
-        self._copy_resources_to_dir(temp_dir, info['resources'].values())
+        self._copy_resources_to_dir(temp_dir, info['resources'])
 
         shutil.copy(info['index_path'], os.path.join(temp_dir, 'index.html'))
         return temp_dir
